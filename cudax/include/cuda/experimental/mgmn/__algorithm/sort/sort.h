@@ -25,20 +25,17 @@
 #include <cuda/__nvtx/nvtx.h>
 #include <cuda/std/__functional/operations.h>
 #include <cuda/std/__iterator/concepts.h>
-#include <cuda/std/__iterator/readable_traits.h>
 #include <cuda/std/__memory/addressof.h>
 #include <cuda/std/__ranges/concepts.h>
-#include <cuda/std/__ranges/size.h>
 #include <cuda/std/__type_traits/is_callable.h>
-#include <cuda/std/__type_traits/remove_cvref.h>
+#include <cuda/std/__type_traits/is_same.h>
 #include <cuda/std/__type_traits/remove_reference.h>
 #include <cuda/std/__utility/move.h>
 #include <cuda/std/span>
 
 #include <cuda/experimental/__utility/result_policy.cuh>
 #include <cuda/experimental/mgmn/__algorithm/common.h>
-#include <cuda/experimental/mgmn/__algorithm/sort/hss/execute.h>
-#include <cuda/experimental/mgmn/__algorithm/sort/hss/sorter.h>
+#include <cuda/experimental/mgmn/__algorithm/sort/execute.h>
 #include <cuda/experimental/mgmn/__concepts/common.h>
 #include <cuda/experimental/mgmn/__concepts/communicator.h>
 
@@ -65,8 +62,8 @@ _CCCL_BEGIN_NAMESPACE_ARCH_DEPENDENT
 //!
 //! @snippet sort/range_basic.cu sort
 //!
-//! All four outer ranges must have the same length. The algorithm caps lockstep iteration at
-//! the shortest range, but this must not be relied upon and may change at any time. Each input
+//! An empty communicator range is a no-op. Otherwise all four outer ranges must have the same
+//! length; a mismatch throws `std::invalid_argument`. Each input
 //! iterator must refer to writable device-accessible storage for at least as many values as the
 //! corresponding input size gives, and must be contiguous.
 //!
@@ -76,6 +73,8 @@ _CCCL_BEGIN_NAMESPACE_ARCH_DEPENDENT
 //! Each environment supplies the *required* stream and optional memory resource for its local
 //! rank, and is also forwarded to the underlying CUB algorithms, so it may carry any
 //! parameters CUB recognizes.
+//! Local ranks participate on separate host threads. A memory resource shared by multiple
+//! local ranks must support concurrent host calls.
 //!
 //! @param[in] __policy The result policy object. Currently must be `cudax::distributed`.
 //! @param[in] __comms The range of communicators.
@@ -93,7 +92,7 @@ _CCCL_TEMPLATE(class _Policy,
 _CCCL_REQUIRES(__range_of_communicators<_CommRange> _CCCL_AND ::cuda::std::ranges::forward_range<_EnvRange>
                  _CCCL_AND ::cuda::experimental::mgmn::__detail::__range_of_random_access_iterators<_InputIterRange>
                    _CCCL_AND ::cuda::std::ranges::forward_range<_SizeTRange>)
-void sort(const ::cuda::experimental::__result_policy_base<_Policy>& __policy,
+void sort([[maybe_unused]] const ::cuda::experimental::__result_policy_base<_Policy>& __policy,
           _CommRange&& __comms,
           _EnvRange&& __envs,
           _InputIterRange&& __input_iters,
@@ -106,24 +105,15 @@ void sort(const ::cuda::experimental::__result_policy_base<_Policy>& __policy,
   // that get_stream_t is a normal CPO and normally callable.
   static_assert(::cuda::std::__is_callable_v<::cuda::get_stream_t, _Env>, "Environment must contain a stream");
 
-  if (::cuda::std::ranges::size(__comms) == 0)
-  {
-    // We have no inputs, so... nothing to do
-    return;
-  }
-
+  static_assert(::cuda::std::is_same_v<_Policy, ::cuda::experimental::distributed_t>,
+                "sort requires cuda::experimental::distributed");
   _CCCL_NVTX_RANGE_SCOPE("cuda::experimental::mgmn::sort");
-
-  using _Tp =
-    ::cuda::std::iter_value_t<::cuda::std::remove_cvref_t<::cuda::std::ranges::range_reference_t<_InputIterRange>>>;
-
-  ::cuda::experimental::mgmn::__detail::__hss_sort::_HSSSorter<_Tp, _Env, ::cuda::std::remove_cvref_t<_BinaryOp>>::
-    __execute(__policy,
-              ::cuda::std::forward<_CommRange>(__comms),
-              ::cuda::std::forward<_EnvRange>(__envs),
-              ::cuda::std::forward<_InputIterRange>(__input_iters),
-              ::cuda::std::forward<_SizeTRange>(__num_items_range),
-              ::cuda::std::move(__cmp));
+  ::cuda::experimental::mgmn::__detail::__sort::__execute_range(
+    ::cuda::std::forward<_CommRange>(__comms),
+    ::cuda::std::forward<_EnvRange>(__envs),
+    ::cuda::std::forward<_InputIterRange>(__input_iters),
+    ::cuda::std::forward<_SizeTRange>(__num_items_range),
+    ::cuda::std::move(__cmp));
 }
 
 //! @brief Sort a single input over one communicator in place.
