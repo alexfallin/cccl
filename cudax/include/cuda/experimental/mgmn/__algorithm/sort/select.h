@@ -219,7 +219,7 @@ enum class __selection_phase
 };
 
 template <__selection_phase _Phase, class _Tp, class _BinaryOp>
-_CCCL_KERNEL_ATTRIBUTES void __select(
+_CCCL_DEVICE_API void __select_step(
   const _Tp* __keys,
   __index_type __size,
   int __rank,
@@ -342,6 +342,25 @@ _CCCL_KERNEL_ATTRIBUTES void __select(
       }
     }
   }
+}
+
+template <__selection_phase _Phase, class _Tp, class _BinaryOp>
+_CCCL_KERNEL_ATTRIBUTES void __select(
+  const _Tp* __keys,
+  __index_type __size,
+  int __rank,
+  int __ranks,
+  __selection_message<_Tp>* __source,
+  const __selection_message<_Tp>* __gathered,
+  __selection_state<_Tp>* __states,
+  int* __unfinished,
+  _BinaryOp __cmp,
+  const __index_type* __targets,
+  bool __uniform,
+  __index_type* __cuts)
+{
+  ::cuda::experimental::mgmn::__detail::__sort::__select_step<_Phase>(
+    __keys, __size, __rank, __ranks, __source, __gathered, __states, __unfinished, __cmp, __targets, __uniform, __cuts);
 }
 _CCCL_END_NAMESPACE_ARCH_DEPENDENT
 } // namespace __detail::__sort

@@ -76,6 +76,16 @@ _CCCL_BEGIN_NAMESPACE_ARCH_DEPENDENT
 //! Local ranks participate on separate host threads. A memory resource shared by multiple
 //! local ranks must support concurrent host calls.
 //!
+//! When built with NCCL 2.29.2 or newer device headers, NCCL communicators use a device
+//! communicator for multi-rank selection and redistribution. All ranks must support the NCCL
+//! device API. Communication outside the NCCL load/store-accessible team additionally requires
+//! GPU-initiated networking (GIN). Unsupported communicators throw `std::runtime_error`.
+//! This path allocates an equally sized symmetric communication window on every rank with
+//! `ncclMemAlloc`; that window does not use the environment's memory resource. CUB and other
+//! temporary allocations use the environment as usual. The caller's storage is not resized or
+//! registered. The window and device communicator are released after the final output copy
+//! completes on the supplied stream. Generic communicators retain the host collective path.
+//!
 //! @param[in] __policy The result policy object. Currently must be `cudax::distributed`.
 //! @param[in] __comms The range of communicators.
 //! @param[in] __envs The range of execution environments. Each environment must contain a
@@ -137,10 +147,11 @@ void sort([[maybe_unused]] const ::cuda::experimental::__result_policy_base<_Pol
 //! serially on one thread deadlocks. Prefer the range overload in that case.
 //!
 //! `__input_iter` must refer to writable device-accessible storage for at least `__num_items`
-//! values and must be contiguous, since it is handed to the communicator collectives directly.
+//! values and must be contiguous.
 //!
 //! The environment supplies the stream and optional memory resource for the local rank, and is
-//! also forwarded to the underlying CUB algorithms.
+//! also forwarded to the underlying CUB algorithms. See the range overload for NCCL device
+//! communicator requirements and symmetric scratch allocation.
 //!
 //! @param[in] __policy The result policy object. Currently must be `cudax::distributed`.
 //! @param[in] __comm The communicator.

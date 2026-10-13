@@ -171,3 +171,56 @@ MULTI_GPU_TEST("sort, rejects mismatched nonempty outer ranges", )
   streams.pop_back();
   REQUIRE_THROWS_AS(cudax::mgmn::sort(cudax::distributed, comms, streams, inputs, counts), std::invalid_argument);
 }
+
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+MULTI_GPU_TEST("sort, device communicator repeated exchanges and empty transfers", )
+{
+  auto comms = this->communicators();
+  if (comms.size() < 2)
+  {
+    SKIP("Device communication requires at least two GPUs");
+  }
+  for (auto comm : comms)
+  {
+    ncclCommProperties properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+    REQUIRE(ncclCommQueryProperties(comm.native_handle(), &properties) == ncclSuccess);
+    if (!properties.deviceApiSupport
+        || (ncclTeamLsa(comm.native_handle()).nRanks != comm.size() && properties.ginType == NCCL_GIN_TYPE_NONE))
+    {
+      SKIP("The communicator does not support the required NCCL device transport");
+    }
+  }
+  auto streams_owned = nccl_test_util::make_streams();
+  auto streams       = std::vector<cuda::stream_ref>{streams_owned.begin(), streams_owned.end()};
+  // Reuse the host communicator across calls, but recreate windows and device
+  // resources. This catches stale signals as well as zero-count send omissions.
+  for (int iteration = 0; iteration < 4; ++iteration)
+  {
+    CAPTURE(iteration);
+    std::vector<std::vector<int>> host_inputs(comms.size());
+    std::vector<cuda::std::int64_t> counts;
+    for (cuda::std::size_t rank = 0; rank < comms.size(); ++rank)
+    {
+      const auto count = iteration == 1 && rank % 2 == 0 ? 0 : 4099 + 17 * rank;
+      counts.push_back(static_cast<cuda::std::int64_t>(count));
+      for (cuda::std::size_t index = 0; index < count; ++index)
+      {
+        const auto value = iteration == 2 ? 7 : static_cast<int>((index * 917 + rank * 61) % 8191) - 4095;
+        host_inputs[rank].push_back(value);
+      }
+    }
+    auto buffers = sort_test_util::make_device_inputs(comms, streams, host_inputs);
+    std::vector<int*> inputs;
+    for (auto& buffer : buffers)
+    {
+      inputs.push_back(buffer.data());
+    }
+    const masked_less cmp{static_cast<cuda::std::uint32_t>(iteration * 0x555aaaaU)};
+    const auto expected = sort_test_util::sorted_reference(host_inputs, cmp);
+    cudax::mgmn::sort(cudax::distributed, comms, streams, inputs, counts, cmp);
+    const auto actual = sort_test_util::gather_outputs(comms, buffers);
+    sort_test_util::check_matches(streams[0], actual, expected);
+    sort_test_util::check_rank_sizes(comms, buffers, host_inputs);
+  }
+}
+#endif // _CUDAX_SORT_HAS_NCCL_DEVICE

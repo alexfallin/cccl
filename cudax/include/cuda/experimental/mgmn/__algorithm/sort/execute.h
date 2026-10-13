@@ -36,12 +36,14 @@
 #include <cuda/std/__type_traits/remove_cv.h>
 #include <cuda/std/__type_traits/remove_cvref.h>
 #include <cuda/std/__utility/declval.h>
+#include <cuda/std/__utility/move.h>
 #include <cuda/std/__utility/swap.h>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 #include <cuda/std/limits>
 
 #include <cuda/experimental/mgmn/__algorithm/common.h>
+#include <cuda/experimental/mgmn/__algorithm/sort/device.h>
 #include <cuda/experimental/mgmn/__algorithm/sort/select.h>
 
 #include <condition_variable>
@@ -256,6 +258,207 @@ public:
   }
 };
 
+struct __run
+{
+  ::cuda::std::int64_t __offset_, __count_;
+};
+
+template <class _Key, class _Compare, class _Env>
+_CCCL_HOST_API void __merge_received(
+  _Key* __received,
+  ::cuda::std::int64_t __size,
+  ::std::vector<__run> __runs,
+  _Key* __keys,
+  _Compare __cmp,
+  const _Env& __env)
+{
+  const auto __stream = ::cuda::get_stream(__env);
+  const __scratch_allocator<_Env> __allocate{__env, __stream};
+  auto __scratch       = __allocate.template operator()<_Key>(::cuda::std::max<::cuda::std::int64_t>(__size, 1));
+  _Key* __merge_input  = __received;
+  _Key* __merge_output = __scratch.data();
+  __merge_streams __streams{__runs.size() / 2};
+  while (__runs.size() > 1)
+  {
+    ::std::vector<__run> __next;
+    ::cuda::std::int64_t __sorted_output_offset = 0;
+    const ::cuda::std::size_t __pairs           = __runs.size() / 2;
+    for (::cuda::std::size_t __pair = 0; __pair < __pairs; ++__pair)
+    {
+      const auto __a = __runs[2 * __pair], __b = __runs[2 * __pair + 1];
+      // Override only the stream; preserve resource, tuning and all other
+      // CUB environment queries. Each concurrent merge owns its scratch.
+      auto __merge_env =
+        ::cuda::std::execution::env<::cuda::stream_ref, const _Env&>{::cuda::stream_ref{__streams[__pair]}, __env};
+      ::cuda::experimental::mgmn::__detail::__sort::__check(CUB_NS_QUALIFIER::DeviceMerge::MergeKeys(
+        __merge_input + __a.__offset_,
+        __a.__count_,
+        __merge_input + __b.__offset_,
+        __b.__count_,
+        __merge_output + __sorted_output_offset,
+        __cmp,
+        __merge_env));
+      __next.push_back({__sorted_output_offset, __a.__count_ + __b.__count_});
+      __sorted_output_offset += __a.__count_ + __b.__count_;
+    }
+    if (__runs.size() % 2)
+    {
+      const auto __tail = __runs.back();
+      ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+        __merge_output + __sorted_output_offset,
+        __merge_input + __tail.__offset_,
+        __tail.__count_ * sizeof(_Key),
+        ::cudaMemcpyDeviceToDevice,
+        __streams[0]));
+      __next.push_back({__sorted_output_offset, __tail.__count_});
+    }
+    __streams.__wait(__pairs);
+    __runs.swap(__next);
+    ::cuda::std::swap(__merge_input, __merge_output);
+  }
+  if (__size)
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+      __keys, __merge_input + __runs[0].__offset_, __size * sizeof(_Key), ::cudaMemcpyDeviceToDevice, __stream.get()));
+  }
+  // Buffers free on the caller stream after the final copy. The caller can
+  // enqueue consumers there immediately, or synchronize that stream to wait.
+}
+
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+template <class _Comm, class _Env, class _Key, class _Compare>
+_CCCL_HOST_API void __sort_device(
+  _Comm& __comm,
+  const _Env& __env,
+  _Key* __keys,
+  __index_type __size,
+  const ::std::vector<__index_type>& __targets,
+  bool __uniform,
+  _Compare __cmp)
+{
+  const auto __stream = ::cuda::get_stream(__env);
+  const __scratch_allocator<_Env> __allocate{__env, __stream};
+  const int __ranks = __comm.size(), __rank = __comm.rank();
+  const auto __width      = static_cast<::cuda::std::size_t>(__ranks) + 1;
+  __index_type __capacity = 1;
+  for (int __peer = 0; __peer < __ranks; ++__peer)
+  {
+    __capacity = ::cuda::std::max(__capacity, __targets[__peer + 1] - __targets[__peer]);
+  }
+  ::ncclCommProperties __properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+  ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
+    ::ncclCommQueryProperties(__comm.native_handle(), &__properties));
+  const bool __gin = ::ncclTeamLsa(__comm.native_handle()).nRanks != __ranks;
+  // Agree on support before entering collective window/communicator creation.
+  __pinned_buffer<int> __capabilities{__width};
+  __capabilities[__ranks]  = __properties.deviceApiSupport && (!__gin || __properties.ginType != NCCL_GIN_TYPE_NONE);
+  auto __capability_source = __allocate.template operator()<int>(1);
+  auto __capability_result = __allocate.template operator()<int>(__ranks);
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+    __capability_source.data(),
+    __capabilities.__data() + __ranks,
+    sizeof(int),
+    ::cudaMemcpyHostToDevice,
+    __stream.get()));
+  ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
+    __comm, __capability_source.data(), __capability_result.data(), 1, __stream);
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+    __capabilities.__data(),
+    __capability_result.data(),
+    __ranks * sizeof(int),
+    ::cudaMemcpyDeviceToHost,
+    __stream.get()));
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
+  for (int __peer = 0; __peer < __ranks; ++__peer)
+  {
+    if (!__capabilities[__peer])
+    {
+      _CCCL_THROW(::std::runtime_error, "Distributed sort requires NCCL device API support and GIN for non-LSA peers");
+    }
+  }
+  __device_layout __layout{};
+  __layout.__source_     = __layout.template __append<__selection_message<_Key>>(__width);
+  __layout.__gathered_   = __layout.template __append<__selection_message<_Key>>(__width * __ranks);
+  __layout.__local_cuts_ = __layout.template __append<__index_type>(__width);
+  __layout.__cuts_       = __layout.template __append<__index_type>(__width * __ranks);
+  __layout.__targets_    = __layout.template __append<__index_type>(__width);
+  __layout.__sorted_     = __layout.template __append<_Key>(__capacity);
+  __layout.__received_   = __layout.template __append<_Key>(__capacity + __index_type{30} * __ranks);
+  __device_window __window{__comm.native_handle(), __stream.get(), __layout.__bytes_, __gin};
+  auto __states    = __allocate.template operator()<__selection_state<_Key>>(__width);
+  auto* __sorted   = __window.template __at<_Key>(__layout.__sorted_);
+  auto* __received = __window.template __at<_Key>(__layout.__received_);
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+    __window.template __at<__index_type>(__layout.__targets_),
+    __targets.data(),
+    __width * sizeof(__index_type),
+    ::cudaMemcpyHostToDevice,
+    __stream.get()));
+  ::cuda::experimental::mgmn::__detail::__sort::__local_sort(__keys, __sorted, __size, __cmp, __env);
+  if (__gin)
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::__device_select<true, _Key><<<1, 256, 0, __stream.get()>>>(
+      __window.__device_,
+      __window.__world_barrier_,
+      __window.__window_,
+      __layout,
+      __size,
+      __states.data(),
+      __uniform,
+      __cmp);
+  }
+  else
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::__device_select<false, _Key><<<1, 256, 0, __stream.get()>>>(
+      __window.__device_,
+      __window.__world_barrier_,
+      __window.__window_,
+      __layout,
+      __size,
+      __states.data(),
+      __uniform,
+      __cmp);
+  }
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetLastError());
+  __pinned_buffer<__index_type> __cuts{__width * __ranks};
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+    __cuts.__data(),
+    __window.template __at<__index_type>(__layout.__cuts_),
+    __width * __ranks * sizeof(__index_type),
+    ::cudaMemcpyDeviceToHost,
+    __stream.get()));
+  if (__gin)
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<true, _Key>
+      <<<__transfer_blocks, 256, 0, __stream.get()>>>(
+        __window.__device_, __window.__world_barrier_, __window.__window_, __layout);
+  }
+  else
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<false, _Key>
+      <<<__transfer_blocks, 256, 0, __stream.get()>>>(
+        __window.__device_, __window.__world_barrier_, __window.__window_, __layout);
+  }
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetLastError());
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
+  ::std::vector<__run> __runs;
+  __index_type __cursor = 0;
+  for (int __peer = 0; __peer < __ranks; ++__peer)
+  {
+    const auto __begin  = __cuts[__peer * __width + __rank];
+    const auto __count  = __cuts[__peer * __width + __rank + 1] - __begin;
+    const auto __offset = ::cuda::experimental::mgmn::__detail::__sort::__receive_offset(__begin, __count, __cursor);
+    if (__count)
+    {
+      __runs.push_back({__offset, __count});
+    }
+  }
+  ::cuda::experimental::mgmn::__detail::__sort::__merge_received(
+    __received, __size, ::cuda::std::move(__runs), __keys, __cmp, __env);
+  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
+}
+#endif // _CUDAX_SORT_HAS_NCCL_DEVICE
+
 template <class _Comm, class _Env, class _Key, class _Size, class _Compare>
 _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _Size __input_count, _Compare __cmp)
 {
@@ -305,6 +508,17 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
     return;
   }
   const ::cuda::std::int64_t __size = __counts[__rank];
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  if constexpr (::cuda::std::is_same_v<decltype(__comm.native_handle()), ::ncclComm_t>)
+  {
+    if (__ranks > 1)
+    {
+      ::cuda::experimental::mgmn::__detail::__sort::__sort_device(
+        __comm, __env, __keys, __size, __targets, __uniform, __cmp);
+      return;
+    }
+  }
+#endif
   auto __sorted = __allocate.template operator()<_Key>(::cuda::std::max<::cuda::std::int64_t>(__size, 1));
   ::cuda::experimental::mgmn::__detail::__sort::__local_sort(__keys, __sorted.data(), __size, __cmp, __env);
   if (__ranks == 1)
@@ -375,11 +589,6 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
   };
 
   auto __received = __allocate.template operator()<_Key>(__size + __padding);
-  auto __scratch  = __allocate.template operator()<_Key>(::cuda::std::max<::cuda::std::int64_t>(__size, 1));
-  struct __run
-  {
-    ::cuda::std::int64_t __offset_, __count_;
-  };
   ::std::vector<__run> __runs;
   ::cuda::std::int64_t __cursor = 0;
   {
@@ -425,54 +634,8 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
   }
   // Makes receive data and async scratch allocations visible to merge streams.
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
-  _Key* __merge_input  = __received.data();
-  _Key* __merge_output = __scratch.data();
-  __merge_streams __streams{__runs.size() / 2};
-  while (__runs.size() > 1)
-  {
-    ::std::vector<__run> __next;
-    ::cuda::std::int64_t __sorted_output_offset = 0;
-    const ::cuda::std::size_t __pairs           = __runs.size() / 2;
-    for (::cuda::std::size_t __pair = 0; __pair < __pairs; ++__pair)
-    {
-      const auto __a = __runs[2 * __pair], __b = __runs[2 * __pair + 1];
-      // Override only the stream; preserve resource, tuning and all other
-      // CUB environment queries. Each concurrent merge owns its scratch.
-      auto __merge_env =
-        ::cuda::std::execution::env<::cuda::stream_ref, const _Env&>{::cuda::stream_ref{__streams[__pair]}, __env};
-      ::cuda::experimental::mgmn::__detail::__sort::__check(CUB_NS_QUALIFIER::DeviceMerge::MergeKeys(
-        __merge_input + __a.__offset_,
-        __a.__count_,
-        __merge_input + __b.__offset_,
-        __b.__count_,
-        __merge_output + __sorted_output_offset,
-        __cmp,
-        __merge_env));
-      __next.push_back({__sorted_output_offset, __a.__count_ + __b.__count_});
-      __sorted_output_offset += __a.__count_ + __b.__count_;
-    }
-    if (__runs.size() % 2)
-    {
-      const auto __tail = __runs.back();
-      ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-        __merge_output + __sorted_output_offset,
-        __merge_input + __tail.__offset_,
-        __tail.__count_ * sizeof(_Key),
-        ::cudaMemcpyDeviceToDevice,
-        __streams[0]));
-      __next.push_back({__sorted_output_offset, __tail.__count_});
-    }
-    __streams.__wait(__pairs);
-    __runs.swap(__next);
-    ::cuda::std::swap(__merge_input, __merge_output);
-  }
-  if (__size)
-  {
-    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-      __keys, __merge_input + __runs[0].__offset_, __size * sizeof(_Key), ::cudaMemcpyDeviceToDevice, __stream.get()));
-  }
-  // Buffers free on the caller stream after the final copy. The caller can
-  // enqueue consumers there immediately, or synchronize that stream to wait.
+  ::cuda::experimental::mgmn::__detail::__sort::__merge_received(
+    __received.data(), __size, ::cuda::std::move(__runs), __keys, __cmp, __env);
 }
 template <class _CommRange, class _EnvRange, class _InputRange, class _SizeRange, class _Compare = ::cuda::std::less<>>
 _CCCL_HOST_API void __execute_range(
