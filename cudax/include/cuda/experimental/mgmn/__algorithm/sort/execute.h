@@ -21,6 +21,7 @@
 #include <cuda/__memory_resource/allocation_alignment.h>
 #include <cuda/__runtime/api_wrapper.h>
 #include <cuda/std/__algorithm/max.h>
+#include <cuda/std/__exception/cuda_error.h>
 #include <cuda/std/__exception/exception_macros.h>
 #include <cuda/std/__functional/operations.h>
 #include <cuda/std/__iterator/distance.h>
@@ -82,7 +83,7 @@ public:
   }
   __pinned_buffer(const __pinned_buffer&)            = delete;
   __pinned_buffer& operator=(const __pinned_buffer&) = delete;
-  [[nodiscard]] _CCCL_HOST_API _Tp* data() const noexcept
+  [[nodiscard]] _CCCL_HOST_API _Tp* __data() const noexcept
   {
     return __ptr_;
   }
@@ -136,7 +137,7 @@ public:
   {
     return __streams_[__idx];
   }
-  _CCCL_HOST_API void wait(::cuda::std::size_t __count) const
+  _CCCL_HOST_API void __wait(::cuda::std::size_t __count) const
   {
     for (::cuda::std::size_t __idx = 0; __idx < __count; ++__idx)
     {
@@ -277,16 +278,16 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
     (::cuda::std::is_unsigned_v<_Size> ? false : (__input_count < 0))
     || static_cast<::cuda::std::uint64_t>(__input_count) > __limit - __padding
     || (__input_count != 0 && __keys == nullptr);
-  __pinned_buffer<long long> __counts(__ranks + 1);
+  __pinned_buffer<long long> __counts{static_cast<::cuda::std::size_t>(__ranks) + 1};
   __counts[__ranks]    = __invalid ? -1 : static_cast<long long>(__input_count);
   auto __source_count  = __allocate.template operator()<long long>(1);
   auto __device_counts = __allocate.template operator()<long long>(__ranks);
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __source_count.data(), __counts.data() + __ranks, sizeof(long long), ::cudaMemcpyHostToDevice, __stream.get()));
+    __source_count.data(), __counts.__data() + __ranks, sizeof(long long), ::cudaMemcpyHostToDevice, __stream.get()));
   ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
     __comm, __source_count.data(), __device_counts.data(), 1, __stream);
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __counts.data(), __device_counts.data(), __ranks * sizeof(long long), ::cudaMemcpyDeviceToHost, __stream.get()));
+    __counts.__data(), __device_counts.data(), __ranks * sizeof(long long), ::cudaMemcpyDeviceToHost, __stream.get()));
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
   ::std::vector<::cuda::std::int64_t> __targets(__ranks + 1, 0);
   bool __uniform = true;
@@ -319,8 +320,8 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
   auto __states                     = __allocate.template operator()<__selection_state<_Key>>(__ranks + 1);
   auto __device_targets             = __allocate.template operator()<::cuda::std::int64_t>(__ranks + 1);
   auto __unfinished                 = __allocate.template operator()<int>(1);
-  __pinned_buffer<int> __host_unfinished(1);
-  __pinned_buffer<::cuda::std::int64_t> __cuts(::cuda::std::size_t(__ranks + 1) * __ranks);
+  __pinned_buffer<int> __host_unfinished{1};
+  __pinned_buffer<::cuda::std::int64_t> __cuts{static_cast<::cuda::std::size_t>(__ranks + 1) * __ranks};
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
     __device_targets.data(),
     __targets.data(),
@@ -356,14 +357,14 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
       __comm, __source.data(), __gathered.data(), __width, __stream);
     __step(::cuda::std::integral_constant<__phase, __phase::__advance>{});
     ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-      __host_unfinished.data(), __unfinished.data(), sizeof(int), ::cudaMemcpyDeviceToHost, __stream.get()));
+      __host_unfinished.__data(), __unfinished.data(), sizeof(int), ::cudaMemcpyDeviceToHost, __stream.get()));
     ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
   } while (__host_unfinished[0]);
   __step(::cuda::std::integral_constant<__phase, __phase::__export_cuts>{});
   ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
     __comm, __local_cuts.data(), __gathered_cuts.data(), __ranks + 1, __stream);
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __cuts.data(),
+    __cuts.__data(),
     __gathered_cuts.data(),
     ::cuda::std::size_t(__ranks + 1) * __ranks * sizeof(long long),
     ::cudaMemcpyDeviceToHost,
@@ -426,7 +427,7 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
   _Key* __merge_input  = __received.data();
   _Key* __merge_output = __scratch.data();
-  __merge_streams __streams(static_cast<int>(__runs.size() / 2));
+  __merge_streams __streams{__runs.size() / 2};
   while (__runs.size() > 1)
   {
     ::std::vector<__run> __next;
@@ -461,7 +462,7 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
         __streams[0]));
       __next.push_back({__sorted_output_offset, __tail.__count_});
     }
-    __streams.wait(__pairs);
+    __streams.__wait(__pairs);
     __runs.swap(__next);
     ::cuda::std::swap(__merge_input, __merge_output);
   }
