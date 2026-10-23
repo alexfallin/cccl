@@ -84,7 +84,11 @@ _CCCL_BEGIN_NAMESPACE_ARCH_DEPENDENT
 //! `ncclMemAlloc`; that window does not use the environment's memory resource. CUB and other
 //! temporary allocations use the environment as usual. The caller's storage is not resized or
 //! registered. The window and device communicator are released after the final output copy
-//! completes on the supplied stream. Generic communicators retain the host collective path.
+//! completes on the supplied stream unless the environment was produced by
+//! `sort_context::bind`. In that case the context retains those resources for subsequent
+//! calls, growing the workspace collectively as required. Use one context per local rank,
+//! and destroy/reset it before its NCCL communicator and last-used stream. Generic
+//! communicators retain the host collective path.
 //!
 //! @param[in] __policy The result policy object. Currently must be `cudax::distributed`.
 //! @param[in] __comms The range of communicators.

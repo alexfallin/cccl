@@ -22,6 +22,9 @@
 
 #    include <cuda/std/__exception/exception_macros.h>
 #    include <cuda/std/__host_stdlib/stdexcept>
+#    include <cuda/std/__memory/assume_aligned.h>
+#    include <cuda/std/cstdint>
+#    include <cuda/std/cstring>
 #    include <cuda/std/limits>
 
 #    include <cuda/experimental/mgmn/__algorithm/sort/select.h>
@@ -34,7 +37,12 @@ namespace __detail::__sort
 {
 _CCCL_BEGIN_NAMESPACE_ARCH_DEPENDENT
 
-inline constexpr int __transfer_blocks = 32;
+// GIN uses up to 64 chunks, bounded by input bytes and resident capacity.
+inline constexpr int __transfer_blocks = 64;
+// LSA copies run on the SMs and need more CTAs to hide remote-memory latency.
+// This is the upper bound on allocated barrier slots. The launch grid is
+// bounded by the compiled kernel's residency on every participating GPU.
+inline constexpr int __lsa_transfer_blocks = 256;
 
 _CCCL_HOST_API inline void __check_nccl_device(::ncclResult_t __status)
 {
@@ -74,10 +82,16 @@ class __device_window
 {
   ::ncclComm_t __comm_;
   ::cudaStream_t __stream_;
+  int __ordinal_  = 0;
   bool __created_ = false;
+  void* __host_metadata_[2]{};
+  ::cuda::std::size_t __host_capacity_[2]{};
 
   _CCCL_HOST_API void __release() noexcept
   {
+    int __previous = 0;
+    (void) ::cudaGetDevice(&__previous);
+    (void) ::cudaSetDevice(__ordinal_);
     // All kernels and the copy back to the caller must finish before unmapping.
     (void) ::cudaStreamSynchronize(__stream_);
     if (__created_)
@@ -92,6 +106,14 @@ class __device_window
     {
       (void) ::ncclMemFree(__storage_);
     }
+    for (auto* __buffer : __host_metadata_)
+    {
+      if (__buffer)
+      {
+        (void) ::cudaFreeHost(__buffer);
+      }
+    }
+    (void) ::cudaSetDevice(__previous);
   }
 
 public:
@@ -100,6 +122,67 @@ public:
   ::ncclDevComm __device_{};
   ::ncclGinBarrierHandle __world_barrier_{};
   bool __gin_;
+  ::cuda::std::size_t __capacity_ = 0;
+
+  [[nodiscard]] _CCCL_HOST_API bool __matches(::ncclComm_t __comm, int __ordinal, bool __gin) const noexcept
+  {
+    return __comm_ == __comm && __ordinal_ == __ordinal && __gin_ == __gin;
+  }
+
+  _CCCL_HOST_API void __set_stream(::cudaStream_t __stream) noexcept
+  {
+    __stream_ = __stream;
+  }
+
+  // Pinned count and cut buffers are reused only while the context lock is held.
+  // Each transfer into them is synchronized before their next use or destruction.
+  [[nodiscard]] _CCCL_HOST_API void* __host_buffer(int __slot, ::cuda::std::size_t __bytes)
+  {
+    if (__bytes > __host_capacity_[__slot])
+    {
+      void* __next       = nullptr;
+      const auto __error = ::cudaMallocHost(&__next, __bytes);
+      if (__error != ::cudaSuccess)
+      {
+        _CCCL_THROW(::std::runtime_error, ::cudaGetErrorString(__error));
+      }
+      if (__host_metadata_[__slot])
+      {
+        (void) ::cudaFreeHost(__host_metadata_[__slot]);
+      }
+      __host_metadata_[__slot] = __next;
+      __host_capacity_[__slot] = __bytes;
+    }
+    return __host_metadata_[__slot];
+  }
+
+  // All ranks enter together, after prior uses of the old window have completed.
+  // The device communicator and its barrier epochs survive workspace growth.
+  _CCCL_HOST_API void __reserve(::cuda::std::size_t __bytes)
+  {
+    char* __storage         = nullptr;
+    ::ncclWindow_t __window = nullptr;
+    ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
+      ::ncclMemAlloc(reinterpret_cast<void**>(&__storage), __bytes));
+    _CCCL_TRY
+    {
+      ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
+        ::ncclCommWindowRegister(__comm_, __storage, __bytes, &__window, NCCL_WIN_COLL_SYMMETRIC));
+    }
+    _CCCL_CATCH_ALL
+    {
+      (void) ::ncclMemFree(__storage);
+      _CCCL_RETHROW;
+    }
+    if (__window_)
+    {
+      (void) ::ncclCommWindowDeregister(__comm_, __window_);
+      (void) ::ncclMemFree(__storage_);
+    }
+    __storage_  = __storage;
+    __window_   = __window;
+    __capacity_ = __bytes;
+  }
 
   _CCCL_HOST_API __device_window(::ncclComm_t __comm, ::cudaStream_t __stream, ::cuda::std::size_t __bytes, bool __gin)
       : __comm_{__comm}
@@ -108,10 +191,12 @@ public:
   {
     _CCCL_TRY
     {
-      ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
-        ::ncclMemAlloc(reinterpret_cast<void**>(&__storage_), __bytes));
-      ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
-        ::ncclCommWindowRegister(__comm_, __storage_, __bytes, &__window_, NCCL_WIN_COLL_SYMMETRIC));
+      const auto __error = ::cudaGetDevice(&__ordinal_);
+      if (__error != ::cudaSuccess)
+      {
+        _CCCL_THROW(::std::runtime_error, ::cudaGetErrorString(__error));
+      }
+      __reserve(__bytes);
       ::ncclDevCommRequirements __requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
       ::ncclDevResourceRequirements __barrier_requirements{};
       if (__gin_)
@@ -120,13 +205,20 @@ public:
         // insufficient when more than one GPU belongs to each LSA team.
         ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(::ncclGinBarrierCreateRequirement(
           __comm_, ::ncclTeamWorld(__comm_), __transfer_blocks, &__world_barrier_, &__barrier_requirements));
+        // NCCL 2.29.2 drops custom resource signal fields when copying the
+        // requirements. Reserve the barrier signals explicitly after the data
+        // signals, while retaining the barrier's resource buffer requirement.
+        __world_barrier_.signal0                 = __transfer_blocks;
+        __barrier_requirements.ginSignalCount    = 0;
+        __barrier_requirements.outGinSignalStart = nullptr;
+
         __requirements.resourceRequirementsList = &__barrier_requirements;
         __requirements.ginForceEnable           = true;
-        __requirements.ginSignalCount           = __transfer_blocks;
+        __requirements.ginSignalCount           = 2 * __transfer_blocks;
       }
       else
       {
-        __requirements.lsaBarrierCount = __transfer_blocks;
+        __requirements.lsaBarrierCount = __lsa_transfer_blocks;
       }
       ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
         ::ncclDevCommCreate(__comm_, &__requirements, &__device_));
@@ -156,8 +248,53 @@ public:
   }
 };
 
+// Signal slots can retain values after a previous device communicator is destroyed.
+template <class _DeviceComm>
+_CCCL_KERNEL_ATTRIBUTES void __reset_gin_signals(_DeviceComm __comm)
+{
+  ::ncclGin __gin{__comm, static_cast<int>(blockIdx.x)};
+  for (unsigned int __signal = threadIdx.x; __signal < __comm.ginSignalCount; __signal += blockDim.x)
+  {
+    __gin.resetSignal(__signal);
+  }
+}
+
 template <bool _Gin>
 class __device_session;
+
+// Copy complete aligned words without imposing an aliasing type on the keys.
+// Redistribution preserves the source alignment in the destination run. Other
+// callers can have different alignments, in which case the byte path is used.
+_CCCL_DEVICE_API inline void __copy_bytes(char* __dst, const char* __src, ::cuda::std::size_t __bytes)
+{
+  const auto __src_alignment = reinterpret_cast<::cuda::std::uintptr_t>(__src) % 16;
+  const auto __dst_alignment = reinterpret_cast<::cuda::std::uintptr_t>(__dst) % 16;
+  if (__src_alignment == __dst_alignment)
+  {
+    const auto __padding = (16 - __src_alignment) % 16;
+    const auto __head    = __bytes < __padding ? __bytes : __padding;
+    if (threadIdx.x < __head)
+    {
+      __dst[threadIdx.x] = __src[threadIdx.x];
+    }
+    __src += __head;
+    __dst += __head;
+    __bytes -= __head;
+    const auto __words = __bytes / 16;
+    for (::cuda::std::size_t __i = threadIdx.x; __i < __words; __i += blockDim.x)
+    {
+      ::cuda::std::memcpy(
+        ::cuda::std::assume_aligned<16>(__dst + 16 * __i), ::cuda::std::assume_aligned<16>(__src + 16 * __i), 16);
+    }
+    __src += 16 * __words;
+    __dst += 16 * __words;
+    __bytes -= 16 * __words;
+  }
+  for (::cuda::std::size_t __i = threadIdx.x; __i < __bytes; __i += blockDim.x)
+  {
+    __dst[__i] = __src[__i];
+  }
+}
 
 template <>
 class __device_session<false>
@@ -181,10 +318,7 @@ public:
   {
     const auto* __src = static_cast<const char*>(::ncclGetLocalPointer(__win, __source));
     auto* __dst       = static_cast<char*>(::ncclGetLsaPointer(__win, __destination, __peer));
-    for (::cuda::std::size_t __i = threadIdx.x; __i < __bytes; __i += blockDim.x)
-    {
-      __dst[__i] = __src[__i];
-    }
+    ::cuda::experimental::mgmn::__detail::__sort::__copy_bytes(__dst, __src, __bytes);
   }
   _CCCL_DEVICE_API void __end()
   {
@@ -223,10 +357,7 @@ public:
     {
       const auto* __src = static_cast<const char*>(::ncclGetLocalPointer(__win, __source));
       auto* __dst       = static_cast<char*>(::ncclGetLocalPointer(__win, __destination));
-      for (::cuda::std::size_t __i = threadIdx.x; __i < __bytes; __i += blockDim.x)
-      {
-        __dst[__i] = __src[__i];
-      }
+      ::cuda::experimental::mgmn::__detail::__sort::__copy_bytes(__dst, __src, __bytes);
     }
     else if (threadIdx.x == 0)
     {

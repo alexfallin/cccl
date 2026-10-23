@@ -21,6 +21,8 @@
 #include <cuda/__memory_resource/allocation_alignment.h>
 #include <cuda/__runtime/api_wrapper.h>
 #include <cuda/std/__algorithm/max.h>
+#include <cuda/std/__algorithm/min.h>
+#include <cuda/std/__bit/bit_cast.h>
 #include <cuda/std/__exception/cuda_error.h>
 #include <cuda/std/__exception/exception_macros.h>
 #include <cuda/std/__functional/operations.h>
@@ -43,6 +45,7 @@
 #include <cuda/std/limits>
 
 #include <cuda/experimental/mgmn/__algorithm/common.h>
+#include <cuda/experimental/mgmn/__algorithm/sort/context.h>
 #include <cuda/experimental/mgmn/__algorithm/sort/device.h>
 #include <cuda/experimental/mgmn/__algorithm/sort/select.h>
 
@@ -72,16 +75,25 @@ _CCCL_HOST_API inline void __check(::cudaError_t __error)
 template <class _Tp>
 class __pinned_buffer
 {
-  _Tp* __ptr_ = nullptr;
+  _Tp* __ptr_   = nullptr;
+  bool __owned_ = false;
 
 public:
-  _CCCL_HOST_API explicit __pinned_buffer(::cuda::std::size_t __count)
+  _CCCL_HOST_API explicit __pinned_buffer(::cuda::std::size_t __count, _Tp* __borrowed = nullptr)
+      : __ptr_{__borrowed}
+      , __owned_{__borrowed == nullptr}
   {
-    _CCCL_TRY_RUNTIME_API(::cudaMallocHost, "allocating sort metadata", &__ptr_, __count * sizeof(_Tp));
+    if (__owned_)
+    {
+      _CCCL_TRY_RUNTIME_API(::cudaMallocHost, "allocating sort metadata", &__ptr_, __count * sizeof(_Tp));
+    }
   }
   _CCCL_HOST_API ~__pinned_buffer()
   {
-    _CCCL_ASSERT_RUNTIME_API(::cudaFreeHost, "freeing sort metadata", __ptr_);
+    if (__owned_)
+    {
+      _CCCL_ASSERT_RUNTIME_API(::cudaFreeHost, "freeing sort metadata", __ptr_);
+    }
   }
   __pinned_buffer(const __pinned_buffer&)            = delete;
   __pinned_buffer& operator=(const __pinned_buffer&) = delete;
@@ -273,13 +285,40 @@ _CCCL_HOST_API void __merge_received(
   const _Env& __env)
 {
   const auto __stream = ::cuda::get_stream(__env);
+  if (__runs.size() <= 1)
+  {
+    if (__size)
+    {
+      ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
+        __keys, __received + __runs[0].__offset_, __size * sizeof(_Key), ::cudaMemcpyDeviceToDevice, __stream.get()));
+    }
+    return;
+  }
+  if (__runs.size() == 2)
+  {
+    const auto __a = __runs[0], __b = __runs[1];
+    ::cuda::experimental::mgmn::__detail::__sort::__check(CUB_NS_QUALIFIER::DeviceMerge::MergeKeys(
+      __received + __a.__offset_, __a.__count_, __received + __b.__offset_, __b.__count_, __keys, __cmp, __env));
+    return;
+  }
   const __scratch_allocator<_Env> __allocate{__env, __stream};
   auto __scratch       = __allocate.template operator()<_Key>(::cuda::std::max<::cuda::std::int64_t>(__size, 1));
   _Key* __merge_input  = __received;
   _Key* __merge_output = __scratch.data();
+  if (__runs.size() > 1)
+  {
+    // The independent merge streams must wait for the caller-stream allocation.
+    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
+  }
   __merge_streams __streams{__runs.size() / 2};
   while (__runs.size() > 1)
   {
+    // The final merge can write directly to the caller's disjoint output.
+    // Earlier rounds alternate between the receive buffer and scratch.
+    if (__runs.size() == 2)
+    {
+      __merge_output = __keys;
+    }
     ::std::vector<__run> __next;
     ::cuda::std::int64_t __sorted_output_offset = 0;
     const ::cuda::std::size_t __pairs           = __runs.size() / 2;
@@ -316,16 +355,15 @@ _CCCL_HOST_API void __merge_received(
     __runs.swap(__next);
     ::cuda::std::swap(__merge_input, __merge_output);
   }
-  if (__size)
-  {
-    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-      __keys, __merge_input + __runs[0].__offset_, __size * sizeof(_Key), ::cudaMemcpyDeviceToDevice, __stream.get()));
-  }
-  // Buffers free on the caller stream after the final copy. The caller can
-  // enqueue consumers there immediately, or synchronize that stream to wait.
+  // Every merge has completed before the temporary inputs are released.
+  // The final round already wrote the caller's output, so no copy is needed.
 }
 
 #if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+// Count, capability flags, window bytes and resident grid share one agreement.
+inline constexpr int __device_metadata_width = 4;
+inline constexpr int __device_supported = 1, __device_wrong_context = 2, __device_create = 4;
+
 template <class _Comm, class _Env, class _Key, class _Compare>
 _CCCL_HOST_API void __sort_device(
   _Comm& __comm,
@@ -334,6 +372,8 @@ _CCCL_HOST_API void __sort_device(
   __index_type __size,
   const ::std::vector<__index_type>& __targets,
   bool __uniform,
+  const long long* __metadata,
+  bool __gin,
   _Compare __cmp)
 {
   const auto __stream = ::cuda::get_stream(__env);
@@ -345,37 +385,6 @@ _CCCL_HOST_API void __sort_device(
   {
     __capacity = ::cuda::std::max(__capacity, __targets[__peer + 1] - __targets[__peer]);
   }
-  ::ncclCommProperties __properties = NCCL_COMM_PROPERTIES_INITIALIZER;
-  ::cuda::experimental::mgmn::__detail::__sort::__check_nccl_device(
-    ::ncclCommQueryProperties(__comm.native_handle(), &__properties));
-  const bool __gin = ::ncclTeamLsa(__comm.native_handle()).nRanks != __ranks;
-  // Agree on support before entering collective window/communicator creation.
-  __pinned_buffer<int> __capabilities{__width};
-  __capabilities[__ranks]  = __properties.deviceApiSupport && (!__gin || __properties.ginType != NCCL_GIN_TYPE_NONE);
-  auto __capability_source = __allocate.template operator()<int>(1);
-  auto __capability_result = __allocate.template operator()<int>(__ranks);
-  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __capability_source.data(),
-    __capabilities.__data() + __ranks,
-    sizeof(int),
-    ::cudaMemcpyHostToDevice,
-    __stream.get()));
-  ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
-    __comm, __capability_source.data(), __capability_result.data(), 1, __stream);
-  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __capabilities.__data(),
-    __capability_result.data(),
-    __ranks * sizeof(int),
-    ::cudaMemcpyDeviceToHost,
-    __stream.get()));
-  ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
-  for (int __peer = 0; __peer < __ranks; ++__peer)
-  {
-    if (!__capabilities[__peer])
-    {
-      _CCCL_THROW(::std::runtime_error, "Distributed sort requires NCCL device API support and GIN for non-LSA peers");
-    }
-  }
   __device_layout __layout{};
   __layout.__source_     = __layout.template __append<__selection_message<_Key>>(__width);
   __layout.__gathered_   = __layout.template __append<__selection_message<_Key>>(__width * __ranks);
@@ -384,7 +393,71 @@ _CCCL_HOST_API void __sort_device(
   __layout.__targets_    = __layout.template __append<__index_type>(__width);
   __layout.__sorted_     = __layout.template __append<_Key>(__capacity);
   __layout.__received_   = __layout.template __append<_Key>(__capacity + __index_type{30} * __ranks);
-  __device_window __window{__comm.native_handle(), __stream.get(), __layout.__bytes_, __gin};
+  ::cuda::experimental::mgmn::sort_context __temporary;
+  auto* __persistent = ::cuda::__call_or(::cuda::experimental::mgmn::__sort_context_query{}, &__temporary, __env);
+  auto& __owner      = __persistent->__window();
+  int __actions      = 0;
+  bool __grow        = false;
+  int __blocks       = __gin ? __transfer_blocks : __lsa_transfer_blocks;
+  for (int __peer = 0; __peer < __ranks; ++__peer)
+  {
+    const auto __flags = __metadata[__device_metadata_width * __peer + 1];
+    if (!(__flags & __device_supported))
+    {
+      _CCCL_THROW(::std::runtime_error, "Distributed sort requires NCCL device API support and GIN for non-LSA peers");
+    }
+    __actions |= static_cast<int>(__flags);
+    const auto __bytes = ::cuda::std::bit_cast<::cuda::std::uint64_t>(__metadata[__device_metadata_width * __peer + 2]);
+    __grow |= __bytes < __layout.__bytes_;
+    __blocks = ::cuda::std::min(__blocks, static_cast<int>(__metadata[__device_metadata_width * __peer + 3]));
+  }
+  if (__gin)
+  {
+    // Small transfers favor fewer queue operations; larger ones benefit from
+    // concurrent puts. Capacity is the collective maximum, so all ranks use
+    // the same grid even when their local input counts differ.
+    constexpr ::cuda::std::size_t __chunk_bytes = 1 << 20;
+    const auto __wanted                         = ::cuda::std::max<::cuda::std::size_t>(
+      8, (static_cast<::cuda::std::size_t>(__capacity) * sizeof(_Key) - 1) / __chunk_bytes + 1);
+    __blocks =
+      ::cuda::std::min(__blocks, static_cast<int>(::cuda::std::min<::cuda::std::size_t>(__transfer_blocks, __wanted)));
+  }
+  if (__actions & __device_wrong_context)
+  {
+    _CCCL_THROW(::std::invalid_argument, "Sort context belongs to a different NCCL communicator or CUDA device");
+  }
+  // Creation and growth are collective even if only one rank reset its context.
+  if (__actions & __device_create)
+  {
+    __owner.reset();
+    __owner.reset(new __device_window{__comm.native_handle(), __stream.get(), __layout.__bytes_, __gin});
+  }
+  else
+  {
+    __owner->__set_stream(__stream.get());
+    if (__grow)
+    {
+      __owner->__reserve(__layout.__bytes_);
+    }
+  }
+  auto& __window = *__owner;
+  // Barrier sessions retain their epochs across calls. Reset signals only with
+  // newly created resources; resetting them on reuse would strand those epochs.
+  if (__gin && (__actions & __device_create))
+  {
+    ::cuda::experimental::mgmn::__detail::__sort::
+      __reset_gin_signals<<<__window.__device_.ginContextCount, 256, 0, __stream.get()>>>(__window.__device_);
+    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetLastError());
+    // Every rank must finish its reset before any rank can send a signal.
+    // These buffers are needed only when a communicator is newly created.
+    auto __capability_source = __allocate.template operator()<int>(1);
+    auto __capability_result = __allocate.template operator()<int>(__ranks);
+    ::cuda::experimental::mgmn::__detail::__sort::__check(
+      ::cudaMemsetAsync(__capability_source.data(), 0, sizeof(int), __stream.get()));
+    ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
+      __comm, __capability_source.data(), __capability_result.data(), 1, __stream);
+    ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
+  }
   auto __states    = __allocate.template operator()<__selection_state<_Key>>(__width);
   auto* __sorted   = __window.template __at<_Key>(__layout.__sorted_);
   auto* __received = __window.template __at<_Key>(__layout.__received_);
@@ -420,7 +493,8 @@ _CCCL_HOST_API void __sort_device(
       __cmp);
   }
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetLastError());
-  __pinned_buffer<__index_type> __cuts{__width * __ranks};
+  __pinned_buffer<__index_type> __cuts{
+    __width * __ranks, static_cast<__index_type*>(__window.__host_buffer(1, __width * __ranks * sizeof(__index_type)))};
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
     __cuts.__data(),
     __window.template __at<__index_type>(__layout.__cuts_),
@@ -430,13 +504,13 @@ _CCCL_HOST_API void __sort_device(
   if (__gin)
   {
     ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<true, _Key>
-      <<<__transfer_blocks, 256, 0, __stream.get()>>>(
+      <<<__blocks, 256, 0, __stream.get()>>>(
         __window.__device_, __window.__world_barrier_, __window.__window_, __layout);
   }
   else
   {
     ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<false, _Key>
-      <<<__transfer_blocks, 256, 0, __stream.get()>>>(
+      <<<__blocks, 256, 0, __stream.get()>>>(
         __window.__device_, __window.__world_barrier_, __window.__window_, __layout);
   }
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetLastError());
@@ -462,6 +536,18 @@ _CCCL_HOST_API void __sort_device(
 template <class _Comm, class _Env, class _Key, class _Size, class _Compare>
 _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _Size __input_count, _Compare __cmp)
 {
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  ::std::unique_lock<::std::mutex> __context_lock;
+  auto* __persistent = ::cuda::__call_or(
+    ::cuda::experimental::mgmn::__sort_context_query{},
+    static_cast<::cuda::experimental::mgmn::sort_context*>(nullptr),
+    __env);
+  if (__persistent)
+  {
+    // Serialize the metadata collectives too, not just workspace accesses.
+    __context_lock = __persistent->__lock();
+  }
+#endif
   static_assert(::cuda::std::is_integral_v<_Size>, "sort count must be an integer");
   const ::cuda::stream_ref __stream = ::cuda::get_stream(__env);
   const auto __context              = ::cuda::__ensure_current_context{__stream};
@@ -481,40 +567,111 @@ _CCCL_HOST_API void __sort_one(_Comm& __comm, const _Env& __env, _Key* __keys, _
     (::cuda::std::is_unsigned_v<_Size> ? false : (__input_count < 0))
     || static_cast<::cuda::std::uint64_t>(__input_count) > __limit - __padding
     || (__input_count != 0 && __keys == nullptr);
-  __pinned_buffer<long long> __counts{static_cast<::cuda::std::size_t>(__ranks) + 1};
-  __counts[__ranks]    = __invalid ? -1 : static_cast<long long>(__input_count);
-  auto __source_count  = __allocate.template operator()<long long>(1);
-  auto __device_counts = __allocate.template operator()<long long>(__ranks);
+  ::cuda::std::size_t __metadata_width = 1;
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  bool __gin = false;
+  if constexpr (::cuda::std::is_same_v<decltype(__comm.native_handle()), ::ncclComm_t>)
+  {
+    if (__ranks > 1)
+    {
+      __metadata_width = __device_metadata_width;
+    }
+  }
+#endif
+  const auto __metadata_count = __metadata_width * (static_cast<::cuda::std::size_t>(__ranks) + 1);
+  long long* __cached_counts  = nullptr;
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  if (__metadata_width == __device_metadata_width && __persistent && __persistent->__window())
+  {
+    __cached_counts =
+      static_cast<long long*>(__persistent->__window()->__host_buffer(0, __metadata_count * sizeof(long long)));
+  }
+#endif
+  __pinned_buffer<long long> __counts{__metadata_count, __cached_counts};
+  auto* __local_metadata = __counts.__data() + __metadata_width * __ranks;
+  __local_metadata[0]    = __invalid ? -1 : static_cast<long long>(__input_count);
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  if constexpr (::cuda::std::is_same_v<decltype(__comm.native_handle()), ::ncclComm_t>)
+  {
+    if (__ranks > 1)
+    {
+      ::ncclCommProperties __properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+      const auto __property_status      = ::ncclCommQueryProperties(__comm.native_handle(), &__properties);
+      __gin                             = ::ncclTeamLsa(__comm.native_handle()).nRanks != __ranks;
+      int __ordinal                     = 0;
+      ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaGetDevice(&__ordinal));
+      // Cross-rank CTA barriers require a grid that can reside on every GPU.
+      // Query the compiled specialization; the collective takes the rank minimum.
+      int __active_blocks = 0, __multiprocessors = 0;
+      const auto __kernel = __gin ? ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<true, _Key>
+                                  : ::cuda::experimental::mgmn::__detail::__sort::__device_redistribute<false, _Key>;
+      const auto __occupancy_status =
+        ::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&__active_blocks, __kernel, 256, 0);
+      const auto __device_status =
+        ::cudaDeviceGetAttribute(&__multiprocessors, ::cudaDevAttrMultiProcessorCount, __ordinal);
+      const bool __resident = __occupancy_status == ::cudaSuccess && __device_status == ::cudaSuccess
+                           && __active_blocks > 0 && __multiprocessors > 0;
+      const int __blocks =
+        __resident
+          ? ::cuda::std::min(__gin ? __transfer_blocks : __lsa_transfer_blocks, __active_blocks * __multiprocessors)
+          : 0;
+      __local_metadata[3] = __blocks;
+      const auto* __owner = __persistent ? __persistent->__window().get() : nullptr;
+      // Send failures as flags so every rank first participates in the count
+      // agreement. Empty inputs still return without creating a device context.
+      __local_metadata[1] =
+        (__resident && __property_status == ::ncclSuccess && __properties.deviceApiSupport
+             && (!__gin || __properties.ginType != NCCL_GIN_TYPE_NONE)
+           ? __device_supported
+           : 0)
+        | (__owner && !__owner->__matches(__comm.native_handle(), __ordinal, __gin) ? __device_wrong_context : 0)
+        | (!__owner ? __device_create : 0);
+      __local_metadata[2] =
+        ::cuda::std::bit_cast<long long>(static_cast<::cuda::std::uint64_t>(__owner ? __owner->__capacity_ : 0));
+    }
+  }
+#endif
+  auto __source_count  = __allocate.template operator()<long long>(__metadata_width);
+  auto __device_counts = __allocate.template operator()<long long>(__metadata_width * __ranks);
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __source_count.data(), __counts.__data() + __ranks, sizeof(long long), ::cudaMemcpyHostToDevice, __stream.get()));
+    __source_count.data(),
+    __local_metadata,
+    __metadata_width * sizeof(long long),
+    ::cudaMemcpyHostToDevice,
+    __stream.get()));
   ::cuda::experimental::mgmn::__detail::__sort::__all_gather(
-    __comm, __source_count.data(), __device_counts.data(), 1, __stream);
+    __comm, __source_count.data(), __device_counts.data(), __metadata_width, __stream);
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaMemcpyAsync(
-    __counts.__data(), __device_counts.data(), __ranks * sizeof(long long), ::cudaMemcpyDeviceToHost, __stream.get()));
+    __counts.__data(),
+    __device_counts.data(),
+    __metadata_width * __ranks * sizeof(long long),
+    ::cudaMemcpyDeviceToHost,
+    __stream.get()));
   ::cuda::experimental::mgmn::__detail::__sort::__check(::cudaStreamSynchronize(__stream.get()));
   ::std::vector<::cuda::std::int64_t> __targets(__ranks + 1, 0);
   bool __uniform = true;
   for (int __r = 0; __r < __ranks; ++__r)
   {
-    if (__counts[__r] < 0 || __counts[__r] > ::cuda::std::numeric_limits<::cuda::std::int64_t>::max() - __targets[__r])
+    const auto __count = __counts[__metadata_width * __r];
+    if (__count < 0 || __count > ::cuda::std::numeric_limits<::cuda::std::int64_t>::max() - __targets[__r])
     {
       _CCCL_THROW(::std::invalid_argument, "Invalid distributed sort input count or total size overflow");
     }
-    __targets[__r + 1] = __targets[__r] + __counts[__r];
-    __uniform &= __counts[__r] == __counts[0];
+    __targets[__r + 1] = __targets[__r] + __count;
+    __uniform &= __count == __counts[0];
   }
   if (__targets.back() == 0)
   {
     return;
   }
-  const ::cuda::std::int64_t __size = __counts[__rank];
+  const ::cuda::std::int64_t __size = __counts[__metadata_width * __rank];
 #if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
   if constexpr (::cuda::std::is_same_v<decltype(__comm.native_handle()), ::ncclComm_t>)
   {
     if (__ranks > 1)
     {
       ::cuda::experimental::mgmn::__detail::__sort::__sort_device(
-        __comm, __env, __keys, __size, __targets, __uniform, __cmp);
+        __comm, __env, __keys, __size, __targets, __uniform, __counts.__data(), __gin, __cmp);
       return;
     }
   }
@@ -651,6 +808,30 @@ _CCCL_HOST_API void __execute_range(
   {
     _CCCL_THROW(::std::invalid_argument, "Distributed sort ranges must have the same length");
   }
+#if defined(_CUDAX_SORT_HAS_NCCL_DEVICE)
+  if (__count > 1)
+  {
+    ::std::vector<::cuda::experimental::mgmn::sort_context*> __contexts;
+    for (const auto& __env : __envs)
+    {
+      auto* __context = ::cuda::__call_or(
+        ::cuda::experimental::mgmn::__sort_context_query{},
+        static_cast<::cuda::experimental::mgmn::sort_context*>(nullptr),
+        __env);
+      if (__context)
+      {
+        for (auto* __previous : __contexts)
+        {
+          if (__previous == __context)
+          {
+            _CCCL_THROW(::std::invalid_argument, "Each local sort rank requires a distinct context");
+          }
+        }
+        __contexts.push_back(__context);
+      }
+    }
+  }
+#endif
   auto __c = ::cuda::std::ranges::begin(__comms);
   auto __e = ::cuda::std::ranges::begin(__envs);
   auto __i = ::cuda::std::ranges::begin(__inputs);

@@ -20,7 +20,7 @@
 #include "sort_common.cuh"
 #include <c2h/catch2_test_helper.h>
 
-namespace
+namespace sort_contract_test
 {
 // Exercise the public communicator concept without requiring optional collectives.
 struct point_to_point_comm
@@ -64,7 +64,10 @@ struct masked_less
     return (static_cast<cuda::std::uint32_t>(left) ^ mask) < (static_cast<cuda::std::uint32_t>(right) ^ mask);
   }
 };
-} // namespace
+} // namespace sort_contract_test
+
+using sort_contract_test::masked_less;
+using sort_contract_test::point_to_point_comm;
 
 MULTI_GPU_TEST("sort, fixed subranges and pending stream work", )
 {
@@ -182,7 +185,12 @@ MULTI_GPU_TEST("sort, device communicator repeated exchanges and empty transfers
   }
   for (auto comm : comms)
   {
+    // NCCL's required initializer intentionally omits its output fields.
+    _CCCL_DIAG_PUSH
+    _CCCL_DIAG_SUPPRESS_GCC("-Wmissing-field-initializers")
+    _CCCL_DIAG_SUPPRESS_CLANG("-Wmissing-field-initializers")
     ncclCommProperties properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+    _CCCL_DIAG_POP
     REQUIRE(ncclCommQueryProperties(comm.native_handle(), &properties) == ncclSuccess);
     if (!properties.deviceApiSupport
         || (ncclTeamLsa(comm.native_handle()).nRanks != comm.size() && properties.ginType == NCCL_GIN_TYPE_NONE))
